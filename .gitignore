@@ -1,0 +1,34 @@
+# 敏感配置（绝对不能上传）
+.env
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 数据库 & 缓存（数据放移动硬盘，不入库）
+data/
+
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 测试 & 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
+/tmp/
