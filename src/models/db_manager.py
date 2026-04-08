@@ -20,7 +20,7 @@ engine = create_engine(
     echo=False,
 )
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
 def init_db() -> None:
@@ -33,8 +33,25 @@ def init_db() -> None:
         conn.execute(text("PRAGMA foreign_keys=ON"))
         conn.commit()
 
+    _migrate_schema()
     _seed_source_credibility()
     logger.info("数据库初始化完成: [bold]%s[/bold]", settings.db_path)
+
+
+def _migrate_schema() -> None:
+    """滚动迁移：对现有表增量添加新字段（SQLite 不支持 IF NOT EXISTS，用 try/except）"""
+    migrations = [
+        "ALTER TABLE predictions ADD COLUMN recommended_market TEXT",
+        "ALTER TABLE predictions ADD COLUMN recommended_detail TEXT",
+    ]
+    with engine.connect() as conn:
+        for stmt in migrations:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                # 字段已存在时 SQLite 会抛出 OperationalError，忽略即可
+                pass
 
 
 def _seed_source_credibility() -> None:

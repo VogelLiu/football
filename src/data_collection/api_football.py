@@ -137,9 +137,43 @@ def _request(endpoint: str, params: dict, cache_category: str) -> dict:
 #  公开 API 方法
 # ------------------------------------------------------------------ #
 def get_fixtures(league_id: int, season: int, next_n: int = 10) -> list[dict]:
-    """获取指定联赛下一批 upcoming 赛程"""
+    """获取指定联赛下一批 upcoming 赛程（需要付费计划的 next 参数）"""
     data = _request("fixtures", {"league": league_id, "season": season, "next": next_n}, "fixtures")
     return data.get("response", [])
+
+
+def get_fixtures_by_date(league_id: int, season: int, date: str) -> list[dict]:
+    """
+    获取指定联赛在某日期的赛程（免费计划可用）。
+    date 格式: 'YYYY-MM-DD'
+    """
+    data = _request(
+        "fixtures",
+        {"league": league_id, "season": season, "date": date},
+        "fixtures",
+    )
+    return data.get("response", [])
+
+
+def search_fixtures_around_date(league_id: int, season: int, days_window: int = 3) -> list[dict]:
+    """
+    搜索当前日期前后 days_window 天内的赛程（逐日查询，免费计划兼容）。
+    合并结果去重后返回。
+    """
+    from datetime import date as date_cls, timedelta
+    today = date_cls.today()
+    all_fixtures: dict[int, dict] = {}
+    for delta in range(-1, days_window + 1):
+        d = today + timedelta(days=delta)
+        try:
+            fixtures = get_fixtures_by_date(league_id, season, str(d))
+            for fx in fixtures:
+                fid = fx.get("fixture", {}).get("id")
+                if fid:
+                    all_fixtures[fid] = fx
+        except DailyLimitExceeded:
+            break
+    return list(all_fixtures.values())
 
 
 def get_fixture_detail(fixture_id: int) -> dict:
@@ -151,6 +185,8 @@ def get_fixture_detail(fixture_id: int) -> dict:
 
 def get_standings(league_id: int, season: int) -> list[dict]:
     """获取联赛积分榜"""
+    if not season:
+        return []
     data = _request("standings", {"league": league_id, "season": season}, "standings")
     try:
         return data["response"][0]["league"]["standings"][0]
@@ -160,34 +196,75 @@ def get_standings(league_id: int, season: int) -> list[dict]:
 
 def get_team_statistics(team_id: int, league_id: int, season: int) -> dict:
     """获取球队本赛季统计"""
+    if not team_id or not season:
+        return {}
     data = _request(
         "teams/statistics",
         {"team": team_id, "league": league_id, "season": season},
         "team_statistics",
     )
-    return data.get("response", {})
+    resp = data.get("response", {})
+    # API 出错时 response 可能是空列表而非 dict
+    return resp if isinstance(resp, dict) else {}
 
 
 def get_injuries(fixture_id: int) -> list[dict]:
-    """获取某场比赛的伤兵名单"""
+    """获取某场比赛的伤兵名单（需要 fixture_id）"""
     data = _request("injuries", {"fixture": fixture_id}, "injuries")
     return data.get("response", [])
 
 
-def get_head_to_head(team1_id: int, team2_id: int, last: int = 10) -> list[dict]:
-    """获取两队历史对阵"""
-    data = _request(
-        "fixtures/headtohead",
-        {"h2h": f"{team1_id}-{team2_id}", "last": last},
-        "head_to_head",
-    )
+def get_team_injuries(team_id: int, season: int) -> list[dict]:
+    """
+    获取球队本赛季伤兵/停赛名单（不需要 fixture_id）。
+    API 参数: /injuries?team={id}&season={year}
+    返回列表包含伤病类型、球员姓名、预计复出时间。
+    """
+    data = _request("injuries", {"team": team_id, "season": season}, "injuries")
+    return data.get("response", [])
+
+
+def get_head_to_head(team1_id: int, team2_id: int, last: Optional[int] = None) -> list[dict]:
+    """获取两队历史对阵（last=None 则返回全部，free plan 不支持 last 参数）"""
+    params: dict = {"h2h": f"{team1_id}-{team2_id}"}
+    if last is not None:
+        params["last"] = last
+    data = _request("fixtures/headtohead", params, "head_to_head")
     return data.get("response", [])
 
 
 def get_team_form(team_id: int, last: int = 5) -> list[dict]:
-    """获取球队最近 N 场比赛结果"""
-    data = _request("fixtures", {"team": team_id, "last": last}, "fixtures")
-    return data.get("response", [])
+    """获取球队最近 N 场已完成比赛（免费计划：用日期范围替代 last 参数）"""
+    from datetime import date as date_cls, timedelta
+    today = date_cls.today()
+    from_date = today - timedelta(days=180)
+    data = _request(
+        "fixtures",
+        {"team": team_id, "from": str(from_date), "to": str(today), "status": "FT"},
+        "fixtures",
+    )
+    results = data.get("response", [])
+    results.sort(key=lambda x: x.get("fixture", {}).get("date", ""), reverse=True)
+    return results[:last]
+
+
+def search_team(name: str) -> list[dict]:
+    """
+    按名称搜索球队，返回 API-Football 球队列表（含 id、name、country、logo）。
+    不依赖赛季参数，不消耗额外配额。
+    """
+    data = _request("teams", {"search": name}, "players")  # TTL 24h
+    return [item.get("team", {}) for item in data.get("response", [])]
+
+
+def get_coach(team_id: int) -> dict:
+    """
+    获取球队当前主教练信息（姓名、执教历史）。
+    API 端点: /coachs?team={id}
+    """
+    data = _request("coachs", {"team": team_id}, "players")
+    coaches = data.get("response", [])
+    return coaches[0] if coaches else {}
 
 
 def get_players(team_id: int, season: int) -> list[dict]:
@@ -197,10 +274,15 @@ def get_players(team_id: int, season: int) -> list[dict]:
 
 
 def get_finished_results(league_id: int, season: int, last: int = 5) -> list[dict]:
-    """获取联赛最近 N 场已完成比赛（用于结果回填）"""
+    """获取联赛最近 N 场已完成比赛（用于结果回填，免费计划使用日期范围）"""
+    from datetime import date as date_cls, timedelta
+    today = date_cls.today()
+    from_date = today - timedelta(days=90)
     data = _request(
         "fixtures",
-        {"league": league_id, "season": season, "last": last, "status": "FT"},
+        {"league": league_id, "season": season, "from": str(from_date), "to": str(today), "status": "FT"},
         "results",
     )
-    return data.get("response", [])
+    results = data.get("response", [])
+    results.sort(key=lambda x: x.get("fixture", {}).get("date", ""), reverse=True)
+    return results[:last]

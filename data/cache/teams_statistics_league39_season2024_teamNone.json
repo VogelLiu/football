@@ -1,0 +1,1 @@
+{"get": "teams/statistics", "parameters": {"team": "", "league": "39", "season": "2024"}, "errors": {"team": "The Team field cannot be empty."}, "results": 0, "paging": {"current": 1, "total": 1}, "response": []}

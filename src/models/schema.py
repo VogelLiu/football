@@ -197,6 +197,10 @@ class Prediction(Base):
     pred_asian_hcp: Optional[dict] = Column(JSON)  # {"line":"-0.5","side":"home","confidence":0.55}
     pred_btts: Optional[dict] = Column(JSON)       # {"prediction":"yes","confidence":0.60}
 
+    # 综合推荐
+    recommended_market: Optional[str] = Column(String(20))   # "1x2"/"ou_25"/"asian_hcp"/…
+    recommended_detail: Optional[str] = Column(String(500))  # "主胜，置信度72%"
+
     # 元数据
     prompt_version: int = Column(Integer, default=1)
     reasoning: Optional[str] = Column(Text)        # LLM 推理链

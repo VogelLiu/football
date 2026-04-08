@@ -12,7 +12,7 @@ from sqlalchemy import func
 
 from src.data_collection import get_finished_results
 from src.logger import get_logger
-from src.models import get_db, Match, Prediction, ActualResult, PromptVersion
+from src.models import get_db, Match, Prediction, ActualResult, PromptVersion, SourceCredibility
 from src.agent.prompts import SYSTEM_PROMPT_V1
 
 logger = get_logger(__name__)
@@ -67,6 +67,8 @@ def backfill_results(league_id: int, season: int) -> int:
 
     if updated:
         logger.info("结果回填完成，更新 %d 条预测准确率", updated)
+        _update_source_credibility()
+
     return updated
 
 
@@ -93,14 +95,24 @@ def _evaluate_prediction(pred: Prediction, home_g: int, away_g: int, result_1x2:
         side = pred.pred_ou_25.get("side")
         correct_ou = (side == "over" and total > 2.5) or (side == "under" and total < 2.5)
 
-    # 亚盘（简化：仅判断方向是否正确）
+    # 亚盘（考虑让球线）
     correct_hcp: Optional[bool] = None
     if pred.pred_asian_hcp:
         hcp_side = pred.pred_asian_hcp.get("side")
+        hcp_line_str = pred.pred_asian_hcp.get("line", "0")
+        try:
+            hcp_line = float(str(hcp_line_str).replace("+", ""))
+        except (ValueError, TypeError):
+            hcp_line = 0.0
+
+        # 应用让球线后判断 —— 正为主队受让，负为主队让球
+        # 例: line="-0.5" side="home" → 主队净胜才算赢
         if hcp_side == "home":
-            correct_hcp = result_1x2 in ("1",)
+            adjusted_diff = home_g - away_g + hcp_line   # 主队视角
+            correct_hcp = adjusted_diff > 0
         elif hcp_side == "away":
-            correct_hcp = result_1x2 in ("2",)
+            adjusted_diff = away_g - home_g - hcp_line   # 客队视角（让球线取反）
+            correct_hcp = adjusted_diff > 0
 
     # BTTS
     correct_btts: Optional[bool] = None
@@ -180,18 +192,48 @@ def generate_accuracy_report() -> str:
 
 
 # ------------------------------------------------------------------ #
+# ------------------------------------------------------------------ #
+#  2b. 来源可信度动态更新
+# ------------------------------------------------------------------ #
+def _update_source_credibility() -> None:
+    """
+    根据已评估的预测准确率，更新各数据源的 dynamic_score。
+    逻辑：将系统整体准确率作为所有参与源的动态得分基础值（后续可细化为各源独立贡献）。
+    """
+    overall_stats = analyze_accuracy()
+    if overall_stats.get("total", 0) == 0:
+        return
+
+    overall_acc = overall_stats.get("overall_accuracy", 0.0)
+
+    with get_db() as db:
+        sources = db.query(SourceCredibility).all()
+        for src in sources:
+            # 累计数据点 & 正确次数
+            src.total_data_points += overall_stats["total"]
+            src.verified_correct += int(overall_acc * overall_stats["total"])
+            # 动态得分 = 历史准确率 * 基础可信度（加权平均）
+            if src.total_data_points > 0:
+                raw_acc = src.verified_correct / src.total_data_points
+                src.dynamic_score = round(0.7 * raw_acc + 0.3 * src.base_score, 4)
+        db.commit()
+    logger.info("来源可信度动态得分已更新（总体准确率 %.1f%%）", overall_acc * 100)
+
+
+# ------------------------------------------------------------------ #
 #  3. Prompt 优化 & A/B 测试
 # ------------------------------------------------------------------ #
 def generate_next_prompt_version(base_version: int = 1) -> int:
     """
-    分析当前版本的失败案例，生成改进提示词，存入数据库，返回新版本号。
+    用 LLM 分析失败案例并重写优化版提示词，存入数据库，返回新版本号。
     """
+    from src.agent.llm_providers import llm_provider
+
     stats = analyze_accuracy(prompt_version=base_version)
     if stats.get("total", 0) < 20:
         logger.info("数据不足 20 条，暂不生成新版本（当前 %d 条）", stats.get("total", 0))
         return base_version
 
-    # 收集失败案例
     failure_examples = _collect_failure_examples(base_version, limit=5)
     examples_text = "\n".join(
         f"- 比赛: {ex['match']}，预测: {ex['predicted']}，实际: {ex['actual']}，"
@@ -208,24 +250,37 @@ def generate_next_prompt_version(base_version: int = 1) -> int:
         if accuracy < 0.6
     ]
 
-    addendum = f"""
+    optimization_system = (
+        "你是提示词工程专家，负责根据历史预测错误分析来优化足球预测系统的 System Prompt。\n"
+        "要求：在保持原有分析框架的前提下，针对薄弱市场添加具体的推理改进指引，不得删减原有内容。"
+    )
+    optimization_user = (
+        f"当前预测准确率统计（共 {stats['total']} 场）：\n"
+        f"- 1X2 准确率: {stats['1x2_accuracy']:.1%}\n"
+        f"- 大小球准确率: {stats['ou_25_accuracy']:.1%}\n"
+        f"- 亚盘准确率: {stats['asian_hcp_accuracy']:.1%}\n\n"
+        f"薄弱市场: {', '.join(weak_markets) if weak_markets else '无'}\n\n"
+        f"近期失败案例：\n{examples_text if examples_text else '暂无'}\n\n"
+        f"当前分析框架（System Prompt）：\n---\n{SYSTEM_PROMPT_V1}\n---\n\n"
+        "请在以上 System Prompt 末尾追加一段「自适应优化补丁」，"
+        "针对薄弱市场给出3-5条具体的额外分析指引，使用中文，不超过300字。"
+        "只输出需要追加的补丁文本，不要重复输出原有内容。"
+    )
 
-## 自适应优化说明（v{base_version + 1}，基于 {stats['total']} 场历史数据）
+    try:
+        addendum, _ = llm_provider.call(optimization_system, optimization_user)
+        logger.info("LLM 生成提示词补丁完成（%d 字）", len(addendum))
+    except Exception as exc:
+        logger.warning("LLM 优化失败，使用静态补丁: %s", exc)
+        addendum = (
+            f"\n\n## 自适应优化补丁（v{base_version + 1}）\n"
+            f"薄弱市场: {', '.join(weak_markets) if weak_markets else '无'}\n"
+            f"- 1X2 薄弱时：加权近3场进失球趋势，而非只看胜负\n"
+            f"- 亚盘薄弱时：优先参考主客场历史胜率差异\n"
+            f"- 大小球薄弱时：结合防守战术和主场特性综合判断\n"
+        )
 
-**当前准确率**: 1X2={stats['1x2_accuracy']:.1%} | 大小球={stats['ou_25_accuracy']:.1%} | 亚盘={stats['asian_hcp_accuracy']:.1%}
-
-**薄弱市场**: {', '.join(weak_markets) if weak_markets else '无明显薄弱项'}
-
-**近期失败案例分析**:
-{examples_text if examples_text else '暂无'}
-
-**修正方向**:
-- 预测 1X2 时，请额外关注球队近 3 场的进失球趋势（而非只看胜负）
-- 亚盘预测时，优先参考主客场历史胜率差异
-- 大小球预测时，综合考虑双方防守战术和主场特性
-"""
-
-    new_prompt = SYSTEM_PROMPT_V1 + addendum
+    new_prompt = SYSTEM_PROMPT_V1 + "\n\n" + addendum.strip()
 
     with get_db() as db:
         latest = db.query(PromptVersion).order_by(PromptVersion.version.desc()).first()
@@ -234,12 +289,12 @@ def generate_next_prompt_version(base_version: int = 1) -> int:
         db.add(PromptVersion(
             version=new_version_num,
             system_prompt=new_prompt,
-            description=f"基于 {stats['total']} 条历史数据自动优化，弱点: {weak_markets}",
-            is_active=False,  # 待 A/B 测试后再激活
+            description=f"LLM优化，基于 {stats['total']} 条数据，弱点: {weak_markets}",
+            is_active=False,
         ))
         db.commit()
 
-    logger.info("新提示词版本 v%d 已生成，待 A/B 测试", new_version_num)
+    logger.info("新提示词版本 v%d 已生成（LLM优化），待 A/B 测试", new_version_num)
     return new_version_num
 
 

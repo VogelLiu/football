@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.table import Table
 
 from src.config import settings, LEAGUE_NAMES
-from src.data_collection import get_fixtures, DailyLimitExceeded, get_remaining_quota
+from src.data_collection import get_fixtures_by_date, DailyLimitExceeded, get_remaining_quota
 from src.data_collection.sources import LEAGUE_BY_ID
 from src.logger import get_logger
 from src.models import init_db, check_disk_available, get_db
@@ -100,7 +100,9 @@ def main() -> None:
     logger.info("目标日期: %s | 剩余 API 配额: %d", target_date, get_remaining_quota())
 
     league_ids = [args.league] if args.league else settings.league_ids
-    season = target_date.year if target_date.month >= 8 else target_date.year - 1
+
+    # 全局默认赛季（欧洲联赛 Aug-May 跨年）
+    default_season = target_date.year if target_date.month >= 8 else target_date.year - 1
 
     all_predictions = []
 
@@ -108,17 +110,17 @@ def main() -> None:
         league_cfg = LEAGUE_BY_ID.get(league_id)
         league_name = league_cfg.name_cn if league_cfg else str(league_id)
 
+        # 优先使用联赛配置中的赛季（如中超 2026 日历年制）
+        season = league_cfg.season if league_cfg and league_cfg.season else default_season
+
         try:
-            fixtures = get_fixtures(league_id, season, next_n=10)
+            fixtures = get_fixtures_by_date(league_id, season, str(target_date))
         except DailyLimitExceeded as e:
             logger.error("API 配额耗尽，终止: %s", e)
             break
 
-        # 过滤目标日期的比赛
-        target_fixtures = [
-            fx for fx in fixtures
-            if fx.get("fixture", {}).get("date", "")[:10] == str(target_date)
-        ]
+        # 日期已在 API 请求中过滤，无需二次筛选
+        target_fixtures = fixtures
 
         if not target_fixtures:
             logger.info("[%s] %s 暂无赛程", league_name, target_date)
@@ -172,7 +174,7 @@ def _print_summary_table(predictions: list) -> None:
             f"{psc.get('home','?')}-{psc.get('away','?')} ({psc.get('confidence',0):.0%})",
             f"{pou.get('side','?')} ({pou.get('confidence',0):.0%})",
             f"{php.get('side','?')} {php.get('line','?')} ({php.get('confidence',0):.0%})",
-            pred.pred_1x2.get("prediction", "?") if pred.pred_1x2 else "?",
+            pred.recommended_detail or pred.pred_1x2.get("prediction", "?") if pred.pred_1x2 else "?",
         )
 
     console.print(table)

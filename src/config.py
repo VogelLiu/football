@@ -11,8 +11,10 @@ class Settings(BaseSettings):
     # API Keys
     api_football_key: str = ""
     api_football_host: str = "v3.football.api-sports.io"
+    football_data_key: str = ""  # football-data.org free API key
+    odds_api_key: str = ""  # The Odds API key for Bet365 odds (https://the-odds-api.com/ — free 500/month)
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
 
@@ -23,7 +25,7 @@ class Settings(BaseSettings):
     # 行为配置
     api_daily_limit: int = 100
     log_level: str = "INFO"
-    target_leagues: str = "39,140,78,135,61,169"
+    target_leagues: str = "39,140,78,135,61,169,2"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
